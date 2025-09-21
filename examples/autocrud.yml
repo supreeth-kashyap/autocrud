@@ -1,0 +1,11 @@
+database: sqlite:///dev.db
+expose:
+  models:
+    User: [list, get, create]
+    Order: [list, get]
+  functions:
+    - get_active_users
+security:
+  api_key: test-secret
+rate_limit:
+  requests_per_minute: 100

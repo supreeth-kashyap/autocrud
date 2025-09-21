@@ -1,0 +1,27 @@
+
+[tool.poetry]
+name = "autocrud"
+version = "0.1.0"
+description = "Automatic REST APIs from database models and functions."
+authors = ["Your Name <you@example.com>"]
+license = "MIT"
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "^3.8"
+fastapi = "^0.104.1"
+sqlalchemy = "^2.0.23"
+pydantic = "^2.5.2"
+uvicorn = "^0.24.0.post1"
+pyyaml = "^6.0.1"
+click = "^8.1.7"
+
+[tool.poetry.dev-dependencies]
+pytest = "^7.4.3"
+
+[tool.poetry.scripts]
+autocrud = "autocrud.cli:cli"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
