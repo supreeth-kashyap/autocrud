@@ -6,7 +6,8 @@ expose:
     Order: [list, get]
   functions:
     - get_active_users
-security:
-  api_key: test-secret
+    - greet
+# No key is committed here: export AUTOCRUD_API_KEY before serving this example.
+security: {}
 rate_limit:
   requests_per_minute: 100

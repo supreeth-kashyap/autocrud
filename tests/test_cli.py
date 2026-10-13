@@ -57,6 +57,24 @@ def test_serve_reports_missing_key():
         assert result.exit_code == 1
         assert "missing required key 'security'" in result.output
 
+# Test that serve refuses the old example key, or no key, with a friendly error
+def test_serve_refuses_insecure_or_missing_api_key(monkeypatch):
+    monkeypatch.delenv("AUTOCRUD_API_KEY", raising=False)
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        with open("autocrud.yml", "w") as f:
+            f.write(VALID_CONFIG.replace("api_key: secret", "api_key: test-secret"))
+        result = runner.invoke(cli, ["serve"])
+        assert result.exit_code == 1
+        assert "Refusing to start with the published example API key" in result.output
+        assert "Traceback" not in result.output
+
+        with open("autocrud.yml", "w") as f:
+            f.write(VALID_CONFIG.replace("  api_key: secret\n", "  {}\n"))
+        result = runner.invoke(cli, ["serve"])
+        assert result.exit_code == 1
+        assert "No API key configured" in result.output
+
 def test_serve_reports_missing_models_module():
     runner = CliRunner()
     with runner.isolated_filesystem():

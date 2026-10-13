@@ -1,7 +1,10 @@
 import importlib
 import inspect
+import logging
 import os
+import re
 import sys
+import typing
 from typing import Any, List, Optional
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Response, status
@@ -10,8 +13,10 @@ from sqlalchemy import Column, create_engine, inspect as sa_inspect, select
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Mapper, Session, sessionmaker
-from .config import ConfigError, get_config
-from .security import make_api_key_dependency
+from .config import ConfigError, get_config, model_options
+from .security import make_api_key_dependency, make_rate_limiter, resolve_api_key
+
+logger = logging.getLogger(__name__)
 
 # Environment variable that tells create_app_from_env which config to load
 # (used by `autocrud serve --reload`, where uvicorn needs an import string).
@@ -20,6 +25,9 @@ CONFIG_ENV_VAR = "AUTOCRUD_CONFIG"
 # Pagination bounds for list endpoints.
 LIST_LIMIT_DEFAULT = 100
 LIST_LIMIT_MAX = 1000
+
+# Exposed columns whose names match this get a warning at startup.
+SENSITIVE_FIELD_PATTERN = re.compile(r"password|passwd|secret|token|ssn|email|api_key", re.IGNORECASE)
 
 def _import_module(module_name, key):
     """Imports a module named in the config, importable from the working directory."""
@@ -79,36 +87,116 @@ def _resolve_functions(config):
         )
     return {name: getattr(module, name) for name in requested}
 
+def _function_endpoint(name, func):
+    """
+    Wraps func in an endpoint whose parameters are all query parameters,
+    typed from func's annotations (unannotated ones are strings) and required
+    unless func gives them a default.
+    """
+    try:
+        signature = inspect.signature(func)
+    except (TypeError, ValueError):
+        raise ConfigError(f"Could not read the signature of function '{name}'.")
+    try:
+        hints = typing.get_type_hints(func)
+    except Exception:
+        hints = {}
+    parameters = []
+    for param in signature.parameters.values():
+        if param.kind not in (param.POSITIONAL_OR_KEYWORD, param.KEYWORD_ONLY):
+            raise ConfigError(
+                f"Function '{name}' has parameter '{param.name}' that cannot be passed "
+                "by name; only named parameters can become query parameters."
+            )
+        default = Query(...) if param.default is param.empty else Query(param.default)
+        parameters.append(inspect.Parameter(
+            param.name, inspect.Parameter.KEYWORD_ONLY,
+            default=default, annotation=hints.get(param.name, str),
+        ))
+
+    if inspect.iscoroutinefunction(func):
+        async def endpoint(**kwargs):
+            return await func(**kwargs)
+    else:
+        def endpoint(**kwargs):
+            return func(**kwargs)
+    # Not functools.wraps: FastAPI would follow __wrapped__ back to func's signature.
+    endpoint.__name__ = name
+    endpoint.__doc__ = func.__doc__
+    endpoint.__signature__ = inspect.Signature(parameters)
+    return endpoint
+
 def _python_type(column):
     try:
         return column.type.python_type
     except NotImplementedError:
         return Any
 
-def build_schemas(model):
+def _columns(model):
+    """Maps each column attribute's key to its Column, skipping SQL expressions."""
+    return {
+        attr.key: attr.columns[0] for attr in sa_inspect(model).column_attrs
+        if isinstance(attr.columns[0], Column)
+    }
+
+def _required_on_create(column, autoincrement):
+    if column.primary_key:
+        return column is not autoincrement
+    defaulted = column.default is not None or column.server_default is not None
+    return not (column.nullable or defaulted)
+
+def _check_exclude_fields(model, operations, exclude):
+    """Raises ConfigError for unknown names, or for excluding a column that create needs."""
+    columns = _columns(model)
+    unknown = [key for key in exclude if key not in columns]
+    if unknown:
+        raise ConfigError(
+            f"Unknown field(s) in exclude_fields for model '{model.__name__}': "
+            f"{', '.join(unknown)}. Columns: {', '.join(columns)}."
+        )
+    if "create" in operations:
+        autoincrement = model.__table__.autoincrement_column
+        required = [key for key in exclude if _required_on_create(columns[key], autoincrement)]
+        if required:
+            raise ConfigError(
+                f"Model '{model.__name__}' enables create but excludes required "
+                f"field(s) {', '.join(required)}; give them a default, make them "
+                "nullable, or drop create."
+            )
+
+def _warn_sensitive_fields(model, exclude):
+    for key in _columns(model):
+        if key not in exclude and SENSITIVE_FIELD_PATTERN.search(key):
+            logger.warning(
+                "Model '%s' exposes column '%s', whose name looks sensitive. "
+                "Add it to exclude_fields if clients should not see it.",
+                model.__name__, key,
+            )
+
+def build_schemas(model, exclude=()):
     """
     Returns (Read, Create, Update) Pydantic models for a mapped class.
 
     Read has every column. Create leaves out an autoincrement primary key and
     makes nullable or defaulted columns optional. Update has every non-key
     column, all optional; a non-nullable column still rejects an explicit null.
+    Columns named in exclude are left out of all three.
     """
     autoincrement = model.__table__.autoincrement_column
     read, create, update = {}, {}, {}
-    for attr in sa_inspect(model).column_attrs:
-        column = attr.columns[0]
-        if not isinstance(column, Column):
+    for key, column in _columns(model).items():
+        if key in exclude:
             continue
         python_type = _python_type(column)
         optional_type = Optional[python_type] if column.nullable else python_type
-        read[attr.key] = (optional_type, None) if column.nullable else (python_type, ...)
+        read[key] = (optional_type, None) if column.nullable else (python_type, ...)
+        required = _required_on_create(column, autoincrement)
         if column.primary_key:
-            if column is not autoincrement:
-                create[attr.key] = (python_type, ...)
+            if required:
+                create[key] = (python_type, ...)
             continue
-        defaulted = column.default is not None or column.server_default is not None
-        create[attr.key] = (optional_type, None) if column.nullable or defaulted else (python_type, ...)
-        update[attr.key] = (optional_type, None)
+        create[key] = (python_type, ...) if required else (optional_type, None)
+        update[key] = (optional_type, None)
 
     name = model.__name__
     return (
@@ -150,10 +238,12 @@ def _flush(db):
             detail="The change violates a database constraint.",
         )
 
-def _add_crud_routes(app, model, operations, get_db, api_key_dependency):
+def _add_crud_routes(app, model, operations, exclude, get_db, api_key_dependency):
     """Registers only the configured operations for one mapped class."""
     table = model.__tablename__
-    Read, Create, Update = build_schemas(model)
+    _check_exclude_fields(model, operations, exclude)
+    _warn_sensitive_fields(model, exclude)
+    Read, Create, Update = build_schemas(model, exclude)
     dependencies = [Depends(api_key_dependency)]
     pk_columns = sa_inspect(model).primary_key
     if len(pk_columns) != 1 and any(op in operations for op in ("get", "update", "delete")):
@@ -226,22 +316,27 @@ def generate_app(config):
         version="0.1.0",
     )
 
+    # Resolved once, so a missing or example key stops startup instead of
+    # failing each request.
+    api_key_dependency = make_api_key_dependency(
+        resolve_api_key(config), make_rate_limiter(config),
+    )
     models = _resolve_models(config)
     functions = _resolve_functions(config)
-    operations = (config.get('expose') or {}).get('models') or {}
-    api_key_dependency = make_api_key_dependency(config['security']['api_key'])
+    options = (config.get('expose') or {}).get('models') or {}
 
     # Tables are not created here: they belong to the user's database.
     SessionLocal = sessionmaker(bind=_make_engine(config['database']), autoflush=False)
     get_db = make_session_dependency(SessionLocal)
 
     for name, model in models.items():
-        _add_crud_routes(app, model, operations[name], get_db, api_key_dependency)
+        operations, exclude = model_options(options[name])
+        _add_crud_routes(app, model, operations, exclude, get_db, api_key_dependency)
 
     for name, func in functions.items():
         app.add_api_route(
-            f"/functions/{name}", func, methods=["GET"], name=f"function_{name}",
-            dependencies=[Depends(api_key_dependency)],
+            f"/functions/{name}", _function_endpoint(name, func), methods=["GET"],
+            name=f"function_{name}", dependencies=[Depends(api_key_dependency)],
         )
 
     return app
