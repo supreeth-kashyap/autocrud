@@ -14,6 +14,10 @@ database: sqlite:///dev.db
 # directory you run autocrud in (e.g. "models" for ./models.py, or "myapp.models").
 models_module: models
 
+# Optional module that defines the functions under expose.functions
+# (defaults to models_module).
+# functions_module: myapp.functions
+
 expose:
   # Model class name -> operations to enable ({operations}).
   # Nothing is exposed until you list it here, for example:
@@ -60,15 +64,16 @@ def validate_config(data, path="autocrud.yml"):
     if not isinstance(data, dict):
         fail("expected a mapping of settings at the top level.")
 
-    for key in ("database", "expose", "security"):
+    for key in ("database", "expose", "security", "models_module"):
         if key not in data:
             fail(f"missing required key '{key}'.")
 
     if not isinstance(data["database"], str) or not data["database"]:
         fail("'database' must be a non-empty database URL string.")
 
-    if "models_module" in data and not isinstance(data["models_module"], str):
-        fail("'models_module' must be a module name string.")
+    for key in ("models_module", "functions_module"):
+        if key in data and (not isinstance(data[key], str) or not data[key]):
+            fail(f"'{key}' must be a dotted module path string, e.g. myapp.models.")
 
     expose = data["expose"]
     if not isinstance(expose, dict):

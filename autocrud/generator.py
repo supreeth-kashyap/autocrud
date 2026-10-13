@@ -1,11 +1,15 @@
 import importlib
+import inspect
 import os
 import sys
+from typing import Any, List, Optional
 
-from fastapi import FastAPI, Depends
-from pydantic import BaseModel
-from sqlalchemy import create_engine, Column, Integer, String
-from sqlalchemy.orm import sessionmaker, declarative_base
+from fastapi import Depends, FastAPI, HTTPException, Query, Response, status
+from pydantic import ConfigDict, create_model
+from sqlalchemy import Column, create_engine, inspect as sa_inspect, select
+from sqlalchemy.engine import make_url
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Mapper, Session, sessionmaker
 from .config import ConfigError, get_config
 from .security import make_api_key_dependency
 
@@ -13,77 +17,207 @@ from .security import make_api_key_dependency
 # (used by `autocrud serve --reload`, where uvicorn needs an import string).
 CONFIG_ENV_VAR = "AUTOCRUD_CONFIG"
 
-# Placeholder for dynamically creating Pydantic models
-def create_pydantic_model(sqla_model):
-    # This is a simplified version. A real implementation would need to handle more types and relationships.
-    fields = {}
-    for column in sqla_model.__table__.columns:
-        field_type = str
-        if isinstance(column.type, Integer):
-            field_type = int
-        fields[column.name] = (field_type, ...)
+# Pagination bounds for list endpoints.
+LIST_LIMIT_DEFAULT = 100
+LIST_LIMIT_MAX = 1000
 
-    return type(f"{sqla_model.__name__}Schema", (BaseModel,), {"__annotations__": fields})
-
-def _builtin_models():
-    """Demo models used when the config does not name a models_module."""
-    Base = declarative_base()
-
-    class User(Base):
-        __tablename__ = 'users'
-        id = Column(Integer, primary_key=True, index=True)
-        name = Column(String, index=True)
-        email = Column(String, unique=True, index=True)
-
-    class Order(Base):
-        __tablename__ = 'orders'
-        id = Column(Integer, primary_key=True, index=True)
-        user_id = Column(Integer)
-        amount = Column(Integer)
-
-    return {"User": User, "Order": Order}
-
-def _module_models(module_name):
-    """Imports models_module and returns its SQLAlchemy model classes by name."""
+def _import_module(module_name, key):
+    """Imports a module named in the config, importable from the working directory."""
     if os.getcwd() not in sys.path:
         sys.path.insert(0, os.getcwd())
     try:
-        module = importlib.import_module(module_name)
+        return importlib.import_module(module_name)
     except ImportError as e:
-        raise ConfigError(f"Could not import models_module '{module_name}': {e}")
-    return {
-        name: obj for name, obj in vars(module).items()
-        if isinstance(obj, type) and hasattr(obj, "__table__")
-    }
+        raise ConfigError(f"Could not import {key} '{module_name}': {e}")
+
+def _is_mapped_class(obj):
+    return isinstance(obj, type) and isinstance(sa_inspect(obj, raiseerr=False), Mapper)
+
+def _module_models(module_name):
+    """Imports models_module and returns its SQLAlchemy mapped classes by name."""
+    module = _import_module(module_name, "models_module")
+    return {name: obj for name, obj in vars(module).items() if _is_mapped_class(obj)}
 
 def _resolve_models(config):
-    """Maps each model named in expose.models to its class, or raises ConfigError."""
+    """Maps each model named in expose.models to its mapped class, or raises ConfigError."""
     requested = (config.get('expose') or {}).get('models') or {}
     if not requested:
         return {}
     module_name = config.get('models_module')
-    available = _module_models(module_name) if module_name else _builtin_models()
+    if not module_name:
+        raise ConfigError("'models_module' is required to expose models.")
+    available = _module_models(module_name)
     unknown = [name for name in requested if name not in available]
     if unknown:
-        source = f"module '{module_name}'" if module_name else "the built-in demo models"
         raise ConfigError(
             f"Unknown model(s) in expose.models: {', '.join(unknown)}. "
-            f"Available in {source}: {', '.join(sorted(available)) or 'none'}."
+            f"Mapped classes available in module '{module_name}': "
+            f"{', '.join(sorted(available)) or 'none'}."
         )
     return {name: available[name] for name in requested}
 
-def _add_list_route(app, model, SessionLocal, api_key_dependency):
-    @app.get(
-        f"/{model.__tablename__}",
-        name=f"list_{model.__tablename__}",
-        dependencies=[Depends(api_key_dependency)],
+def _resolve_functions(config):
+    """Maps each name in expose.functions to a function from functions_module
+    (default: models_module), or raises ConfigError."""
+    requested = (config.get('expose') or {}).get('functions') or []
+    if not requested:
+        return {}
+    key = 'functions_module' if config.get('functions_module') else 'models_module'
+    module_name = config.get(key)
+    if not module_name:
+        raise ConfigError("'functions_module' or 'models_module' is required to expose functions.")
+    module = _import_module(module_name, key)
+    unknown = [name for name in requested if not callable(getattr(module, name, None))]
+    if unknown:
+        available = sorted(
+            name for name, obj in vars(module).items()
+            if inspect.isfunction(obj) and obj.__module__ == module.__name__
+        )
+        raise ConfigError(
+            f"Unknown function(s) in expose.functions: {', '.join(unknown)}. "
+            f"Functions available in module '{module_name}': {', '.join(available) or 'none'}."
+        )
+    return {name: getattr(module, name) for name in requested}
+
+def _python_type(column):
+    try:
+        return column.type.python_type
+    except NotImplementedError:
+        return Any
+
+def build_schemas(model):
+    """
+    Returns (Read, Create, Update) Pydantic models for a mapped class.
+
+    Read has every column. Create leaves out an autoincrement primary key and
+    makes nullable or defaulted columns optional. Update has every non-key
+    column, all optional; a non-nullable column still rejects an explicit null.
+    """
+    autoincrement = model.__table__.autoincrement_column
+    read, create, update = {}, {}, {}
+    for attr in sa_inspect(model).column_attrs:
+        column = attr.columns[0]
+        if not isinstance(column, Column):
+            continue
+        python_type = _python_type(column)
+        optional_type = Optional[python_type] if column.nullable else python_type
+        read[attr.key] = (optional_type, None) if column.nullable else (python_type, ...)
+        if column.primary_key:
+            if column is not autoincrement:
+                create[attr.key] = (python_type, ...)
+            continue
+        defaulted = column.default is not None or column.server_default is not None
+        create[attr.key] = (optional_type, None) if column.nullable or defaulted else (python_type, ...)
+        update[attr.key] = (optional_type, None)
+
+    name = model.__name__
+    return (
+        create_model(f"{name}Read", __config__=ConfigDict(from_attributes=True), **read),
+        create_model(f"{name}Create", **create),
+        create_model(f"{name}Update", **update),
     )
-    def list_items():
+
+def _make_engine(url):
+    # Sessions are opened, used and closed on different threadpool threads.
+    connect_args = {}
+    if make_url(url).get_backend_name() == "sqlite":
+        connect_args["check_same_thread"] = False
+    return create_engine(url, connect_args=connect_args)
+
+def make_session_dependency(SessionLocal):
+    """Returns a dependency that gives each request its own session: commit on
+    success, roll back on error, always close."""
+    def get_db():
         db = SessionLocal()
         try:
-            return db.query(model).all()
+            yield db
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
         finally:
             db.close()
+
+    return get_db
+
+def _flush(db):
+    try:
+        db.flush()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="The change violates a database constraint.",
+        )
+
+def _add_crud_routes(app, model, operations, get_db, api_key_dependency):
+    """Registers only the configured operations for one mapped class."""
+    table = model.__tablename__
+    Read, Create, Update = build_schemas(model)
+    dependencies = [Depends(api_key_dependency)]
+    pk_columns = sa_inspect(model).primary_key
+    if len(pk_columns) != 1 and any(op in operations for op in ("get", "update", "delete")):
+        raise ConfigError(
+            f"Model '{model.__name__}' has a composite primary key; "
+            "only list and create are supported for it."
+        )
+    pk_type = _python_type(pk_columns[0])
+
+    def get_or_404(db, pk):
+        obj = db.get(model, pk)
+        if obj is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"{model.__name__} {pk} not found.",
+            )
+        return obj
+
+    if "list" in operations:
+        @app.get(f"/{table}", name=f"list_{table}", response_model=List[Read],
+                 dependencies=dependencies)
+        def list_items(
+            limit: int = Query(LIST_LIMIT_DEFAULT, ge=1, le=LIST_LIMIT_MAX),
+            offset: int = Query(0, ge=0),
+            db: Session = Depends(get_db),
+        ):
+            query = select(model).order_by(*pk_columns).offset(offset).limit(limit)
+            return db.scalars(query).all()
+
+    if "get" in operations:
+        @app.get(f"/{table}/{{pk}}", name=f"get_{table}", response_model=Read,
+                 dependencies=dependencies)
+        def get_item(pk: pk_type, db: Session = Depends(get_db)):
+            return get_or_404(db, pk)
+
+    if "create" in operations:
+        @app.post(f"/{table}", name=f"create_{table}", response_model=Read,
+                  status_code=status.HTTP_201_CREATED, dependencies=dependencies)
+        def create_item(payload: Create, db: Session = Depends(get_db)):
+            obj = model(**payload.model_dump(exclude_unset=True))
+            db.add(obj)
+            _flush(db)
+            db.refresh(obj)
+            return obj
+
+    if "update" in operations:
+        @app.patch(f"/{table}/{{pk}}", name=f"update_{table}", response_model=Read,
+                   dependencies=dependencies)
+        def update_item(pk: pk_type, payload: Update, db: Session = Depends(get_db)):
+            obj = get_or_404(db, pk)
+            for key, value in payload.model_dump(exclude_unset=True).items():
+                setattr(obj, key, value)
+            _flush(db)
+            db.refresh(obj)
+            return obj
+
+    if "delete" in operations:
+        @app.delete(f"/{table}/{{pk}}", name=f"delete_{table}",
+                    status_code=status.HTTP_204_NO_CONTENT, response_class=Response,
+                    dependencies=dependencies)
+        def delete_item(pk: pk_type, db: Session = Depends(get_db)):
+            db.delete(get_or_404(db, pk))
+            _flush(db)
+            return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 def generate_app(config):
     app = FastAPI(
@@ -93,18 +227,22 @@ def generate_app(config):
     )
 
     models = _resolve_models(config)
+    functions = _resolve_functions(config)
     operations = (config.get('expose') or {}).get('models') or {}
     api_key_dependency = make_api_key_dependency(config['security']['api_key'])
 
-    engine = create_engine(config['database'])
-    SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-
-    for metadata in {id(m.metadata): m.metadata for m in models.values()}.values():
-        metadata.create_all(bind=engine)
+    # Tables are not created here: they belong to the user's database.
+    SessionLocal = sessionmaker(bind=_make_engine(config['database']), autoflush=False)
+    get_db = make_session_dependency(SessionLocal)
 
     for name, model in models.items():
-        if "list" in operations[name]:
-            _add_list_route(app, model, SessionLocal, api_key_dependency)
+        _add_crud_routes(app, model, operations[name], get_db, api_key_dependency)
+
+    for name, func in functions.items():
+        app.add_api_route(
+            f"/functions/{name}", func, methods=["GET"], name=f"function_{name}",
+            dependencies=[Depends(api_key_dependency)],
+        )
 
     return app
 

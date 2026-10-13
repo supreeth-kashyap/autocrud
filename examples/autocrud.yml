@@ -1,4 +1,5 @@
 database: sqlite:///dev.db
+models_module: examples.demo_app.models
 expose:
   models:
     User: [list, get, create]

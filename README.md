@@ -45,13 +45,28 @@ rate_limit:
   requests_per_minute: 100
 ```
 
-- **`database`**: Your SQLAlchemy database connection string.
-- **`models_module`**: The Python module (importable from the directory you run `autocrud` in) that defines your SQLAlchemy models.
-- **`expose.models`**: The models to expose, by class name. You can specify which CRUD operations (`list`, `get`, `create`, `update`, `delete`) to enable for each model.
-- **`expose.functions`**: A list of regular Python functions you want to expose as secure GET endpoints.
+- **`database`**: Your SQLAlchemy database connection string. AutoCRUD does not create tables; they must already exist.
+- **`models_module`** (required): The dotted import path of the module that defines your SQLAlchemy mapped classes, importable from the directory you run `autocrud` in (e.g. `myapp.models`, or `examples.demo_app.models` for the bundled example).
+- **`functions_module`** (optional): The dotted import path of the module that defines the functions under `expose.functions`. Defaults to `models_module`.
+- **`expose.models`**: The mapped classes to expose, by class name. You can specify which CRUD operations (`list`, `get`, `create`, `update`, `delete`) to enable for each model.
+- **`expose.functions`**: A list of regular Python functions you want to expose as secure GET endpoints at `/functions/{name}`.
 - **`security.api_key`**: The secret key that clients must provide in the `X-API-Key` header to access the API.
 
-The config is checked when you run `serve` or `publish`; a missing key, an unknown operation or an unknown model is reported with a short error message.
+The config is checked when you run `serve` or `publish`; a missing key, an unknown operation or an unknown model is reported with a short error message. An unknown model name lists the mapped classes available in `models_module`.
+
+### Generated Routes
+
+Only the operations you list for a model are registered. For a model whose table is `users`:
+
+| Operation | Route | Notes |
+|-----------|-------|-------|
+| `list` | `GET /users` | `limit` (default 100, max 1000) and `offset` query parameters, ordered by primary key |
+| `get` | `GET /users/{pk}` | 404 if the row does not exist |
+| `create` | `POST /users` | Returns 201 with the created row |
+| `update` | `PATCH /users/{pk}` | Partial update; 404 if the row does not exist |
+| `delete` | `DELETE /users/{pk}` | Returns 204; 404 if the row does not exist |
+
+Request and response bodies use Pydantic schemas built from your columns' Python types: `UserRead` (every column), `UserCreate` (no autoincrement primary key; nullable or defaulted columns optional) and `UserUpdate` (every non-key column optional). A change that violates a database constraint returns 409. Each request gets its own database session, committed on success and rolled back on error.
 
 ### 3. Serve Your API
 
