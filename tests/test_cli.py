@@ -8,6 +8,7 @@ from autocrud.config import get_config
 
 VALID_CONFIG = """\
 database: sqlite:///dev.db
+models_module: examples.demo_app.models
 expose:
   models:
     User: [list, get]
@@ -55,6 +56,15 @@ def test_serve_reports_missing_key():
         result = runner.invoke(cli, ["serve"])
         assert result.exit_code == 1
         assert "missing required key 'security'" in result.output
+
+def test_serve_reports_missing_models_module():
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        with open("autocrud.yml", "w") as f:
+            f.write(VALID_CONFIG.replace("models_module: examples.demo_app.models\n", ""))
+        result = runner.invoke(cli, ["serve"])
+        assert result.exit_code == 1
+        assert "missing required key 'models_module'" in result.output
 
 def test_serve_reports_missing_file():
     runner = CliRunner()
