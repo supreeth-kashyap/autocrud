@@ -9,11 +9,12 @@ from typing import Any, List, Optional
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Response, status
 from pydantic import ConfigDict, create_model
-from sqlalchemy import Column, create_engine, inspect as sa_inspect, select
+from sqlalchemy import Column, MetaData, Table, create_engine, inspect as sa_inspect, select
 from sqlalchemy.engine import make_url
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
+from sqlalchemy.ext.automap import automap_base
 from sqlalchemy.orm import Mapper, Session, sessionmaker
-from .config import ConfigError, get_config, model_options
+from .config import ALL_MODELS, ConfigError, get_config, model_options
 from .security import make_api_key_dependency, make_rate_limiter, resolve_api_key
 
 logger = logging.getLogger(__name__)
@@ -46,23 +47,89 @@ def _module_models(module_name):
     module = _import_module(module_name, "models_module")
     return {name: obj for name, obj in vars(module).items() if _is_mapped_class(obj)}
 
-def _resolve_models(config):
-    """Maps each model named in expose.models to its mapped class, or raises ConfigError."""
+def _reflect(reflect):
+    try:
+        reflect()
+    except SQLAlchemyError as e:
+        raise ConfigError(f"Could not read the database schema: {e}")
+
+def _reflected_models(engine):
+    """
+    Reflects the database with automap; returns its tables by name, each as an
+    automapped class, or as a plain Table when automap could not map it (no
+    primary key, or a many-to-many association table).
+    """
+    Base = automap_base()
+    _reflect(lambda: Base.prepare(autoload_with=engine))
+    mapped = {cls.__table__.name: cls for cls in Base.classes}
+    return {name: mapped.get(name, table) for name, table in Base.metadata.tables.items()}
+
+def inspect_database(url):
+    """Returns the database's tables, sorted by name, for `autocrud inspect` and `init --database`."""
+    engine = _make_engine(url)
+    try:
+        metadata = MetaData()
+        _reflect(lambda: metadata.reflect(bind=engine))
+    finally:
+        engine.dispose()
+    return [metadata.tables[name] for name in sorted(metadata.tables)]
+
+def suggested_models(tables):
+    """
+    Returns expose.models entries for `autocrud init --database`: list and get
+    per table (list alone without a single-column primary key), with
+    sensitive-looking columns in exclude_fields.
+    """
+    models = {}
+    for table in tables:
+        operations = ["list", "get"] if len(table.primary_key.columns) == 1 else ["list"]
+        exclude = [c.key for c in table.columns if SENSITIVE_FIELD_PATTERN.search(c.key)]
+        models[table.name] = (
+            {"operations": operations, "exclude_fields": exclude} if exclude else operations
+        )
+    return models
+
+def _resolve_models(config, engine):
+    """
+    Maps each model named in expose.models to its mapped class, or raises
+    ConfigError. Without models_module, names are tables reflected from engine.
+    """
     requested = (config.get('expose') or {}).get('models') or {}
     if not requested:
         return {}
     module_name = config.get('models_module')
-    if not module_name:
-        raise ConfigError("'models_module' is required to expose models.")
-    available = _module_models(module_name)
+    if module_name:
+        available = _module_models(module_name)
+    else:
+        available = _reflected_models(engine)
+    if requested == ALL_MODELS:
+        logger.warning(
+            "expose.models is '%s': serving all %d table(s) read-only: %s.",
+            ALL_MODELS, len(available), ", ".join(sorted(available)) or "none",
+        )
+        return dict(sorted(available.items()))
     unknown = [name for name in requested if name not in available]
-    if unknown:
+    if unknown and module_name:
         raise ConfigError(
             f"Unknown model(s) in expose.models: {', '.join(unknown)}. "
             f"Mapped classes available in module '{module_name}': "
             f"{', '.join(sorted(available)) or 'none'}."
         )
+    if unknown:
+        raise ConfigError(
+            f"Unknown table(s) in expose.models: {', '.join(unknown)}. "
+            f"Tables in the database: {', '.join(sorted(available)) or 'none'}. "
+            "Without models_module, expose.models names tables; "
+            "'autocrud inspect' lists them."
+        )
     return {name: available[name] for name in requested}
+
+def _all_models_operations(model):
+    """Operations for each model under expose.models: '*': read-only, and get only
+    where there is a single-column primary key."""
+    if isinstance(model, Table) or len(sa_inspect(model).primary_key) != 1:
+        return ["list"]
+    return ["list", "get"]
 
 def _resolve_functions(config):
     """Maps each name in expose.functions to a function from functions_module
@@ -132,8 +199,17 @@ def _python_type(column):
     except NotImplementedError:
         return Any
 
+def _table(model):
+    """The Table behind a mapped class, or model itself if it is an unmapped Table."""
+    return model if isinstance(model, Table) else model.__table__
+
+def _name(model):
+    return model.name if isinstance(model, Table) else model.__name__
+
 def _columns(model):
     """Maps each column attribute's key to its Column, skipping SQL expressions."""
+    if isinstance(model, Table):
+        return {column.key: column for column in model.columns}
     return {
         attr.key: attr.columns[0] for attr in sa_inspect(model).column_attrs
         if isinstance(attr.columns[0], Column)
@@ -151,15 +227,15 @@ def _check_exclude_fields(model, operations, exclude):
     unknown = [key for key in exclude if key not in columns]
     if unknown:
         raise ConfigError(
-            f"Unknown field(s) in exclude_fields for model '{model.__name__}': "
+            f"Unknown field(s) in exclude_fields for model '{_name(model)}': "
             f"{', '.join(unknown)}. Columns: {', '.join(columns)}."
         )
     if "create" in operations:
-        autoincrement = model.__table__.autoincrement_column
+        autoincrement = _table(model).autoincrement_column
         required = [key for key in exclude if _required_on_create(columns[key], autoincrement)]
         if required:
             raise ConfigError(
-                f"Model '{model.__name__}' enables create but excludes required "
+                f"Model '{_name(model)}' enables create but excludes required "
                 f"field(s) {', '.join(required)}; give them a default, make them "
                 "nullable, or drop create."
             )
@@ -170,19 +246,20 @@ def _warn_sensitive_fields(model, exclude):
             logger.warning(
                 "Model '%s' exposes column '%s', whose name looks sensitive. "
                 "Add it to exclude_fields if clients should not see it.",
-                model.__name__, key,
+                _name(model), key,
             )
 
 def build_schemas(model, exclude=()):
     """
-    Returns (Read, Create, Update) Pydantic models for a mapped class.
+    Returns (Read, Create, Update) Pydantic models for a mapped class (or an
+    unmapped reflected Table).
 
     Read has every column. Create leaves out an autoincrement primary key and
     makes nullable or defaulted columns optional. Update has every non-key
     column, all optional; a non-nullable column still rejects an explicit null.
     Columns named in exclude are left out of all three.
     """
-    autoincrement = model.__table__.autoincrement_column
+    autoincrement = _table(model).autoincrement_column
     read, create, update = {}, {}, {}
     for key, column in _columns(model).items():
         if key in exclude:
@@ -198,7 +275,7 @@ def build_schemas(model, exclude=()):
         create[key] = (python_type, ...) if required else (optional_type, None)
         update[key] = (optional_type, None)
 
-    name = model.__name__
+    name = _name(model)
     return (
         create_model(f"{name}Read", __config__=ConfigDict(from_attributes=True), **read),
         create_model(f"{name}Create", **create),
@@ -238,20 +315,49 @@ def _flush(db):
             detail="The change violates a database constraint.",
         )
 
+def _list_only_operations(table, operations):
+    """Warns that an unmapped reflected table is served list-only; returns the
+    operations that remain."""
+    if len(table.primary_key.columns):
+        reason = "is a many-to-many association table"
+    else:
+        reason = "has no primary key"
+    skipped = [op for op in operations if op != "list"]
+    logger.warning(
+        "Table '%s' %s, so only list is served for it%s.",
+        table.name, reason, f" ({', '.join(skipped)} skipped)" if skipped else "",
+    )
+    return [op for op in operations if op == "list"]
+
 def _add_crud_routes(app, model, operations, exclude, get_db, api_key_dependency):
-    """Registers only the configured operations for one mapped class."""
-    table = model.__tablename__
+    """Registers only the configured operations for one mapped class, or list
+    alone for a reflected table that automap could not map."""
+    table = _table(model).name
+    if isinstance(model, Table):
+        operations = _list_only_operations(model, operations)
     _check_exclude_fields(model, operations, exclude)
     _warn_sensitive_fields(model, exclude)
     Read, Create, Update = build_schemas(model, exclude)
     dependencies = [Depends(api_key_dependency)]
-    pk_columns = sa_inspect(model).primary_key
-    if len(pk_columns) != 1 and any(op in operations for op in ("get", "update", "delete")):
-        raise ConfigError(
-            f"Model '{model.__name__}' has a composite primary key; "
-            "only list and create are supported for it."
-        )
-    pk_type = _python_type(pk_columns[0])
+    if isinstance(model, Table):
+        # No identity to load rows by: read them with Core, ordered by every
+        # column so pages are stable.
+        order_by = list(model.columns)
+
+        def fetch(db, query):
+            return [dict(row) for row in db.execute(query).mappings()]
+    else:
+        pk_columns = sa_inspect(model).primary_key
+        if len(pk_columns) != 1 and any(op in operations for op in ("get", "update", "delete")):
+            raise ConfigError(
+                f"Model '{model.__name__}' has a composite primary key; "
+                "only list and create are supported for it."
+            )
+        pk_type = _python_type(pk_columns[0])
+        order_by = pk_columns
+
+        def fetch(db, query):
+            return db.scalars(query).all()
 
     def get_or_404(db, pk):
         obj = db.get(model, pk)
@@ -270,8 +376,8 @@ def _add_crud_routes(app, model, operations, exclude, get_db, api_key_dependency
             offset: int = Query(0, ge=0),
             db: Session = Depends(get_db),
         ):
-            query = select(model).order_by(*pk_columns).offset(offset).limit(limit)
-            return db.scalars(query).all()
+            query = select(model).order_by(*order_by).offset(offset).limit(limit)
+            return fetch(db, query)
 
     if "get" in operations:
         @app.get(f"/{table}/{{pk}}", name=f"get_{table}", response_model=Read,
@@ -321,16 +427,21 @@ def generate_app(config):
     api_key_dependency = make_api_key_dependency(
         resolve_api_key(config), make_rate_limiter(config),
     )
-    models = _resolve_models(config)
+    # Tables are not created here: they belong to the user's database, and
+    # without models_module they are reflected from it.
+    engine = _make_engine(config['database'])
+    models = _resolve_models(config, engine)
     functions = _resolve_functions(config)
     options = (config.get('expose') or {}).get('models') or {}
 
-    # Tables are not created here: they belong to the user's database.
-    SessionLocal = sessionmaker(bind=_make_engine(config['database']), autoflush=False)
+    SessionLocal = sessionmaker(bind=engine, autoflush=False)
     get_db = make_session_dependency(SessionLocal)
 
     for name, model in models.items():
-        operations, exclude = model_options(options[name])
+        if options == ALL_MODELS:
+            operations, exclude = _all_models_operations(model), []
+        else:
+            operations, exclude = model_options(options[name])
         _add_crud_routes(app, model, operations, exclude, get_db, api_key_dependency)
 
     for name, func in functions.items():
