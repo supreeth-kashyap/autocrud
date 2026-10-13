@@ -1,8 +1,14 @@
+import os
+import secrets
+
 from autocrud.config import get_config
 from autocrud.generator import generate_app
+from autocrud.security import API_KEY_ENV_VAR
 
 def run_tests():
     print("Running tests...")
+    # The example config commits no key; generate_app refuses to start without one.
+    os.environ.setdefault(API_KEY_ENV_VAR, secrets.token_urlsafe(32))
     try:
         # Test 1: Config Loading
         config = get_config('examples/autocrud.yml')

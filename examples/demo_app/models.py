@@ -22,3 +22,8 @@ def get_active_users():
     """Example function to be exposed via the API."""
     # In a real app, this would query the database for active users
     return [{"id": 1, "name": "John Doe", "status": "active"}]
+
+
+def greet(name: str, times: int = 1):
+    """Example function with typed query parameters: GET /functions/greet?name=Ada&times=2."""
+    return {"greeting": " ".join([f"Hello, {name}!"] * times)}

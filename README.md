@@ -35,7 +35,9 @@ database: sqlite:///dev.db
 models_module: myapp.models
 expose:
   models:
-    User: [list, get, create]
+    User:
+      operations: [list, get, update]
+      exclude_fields: [password_hash]
     Order: [list, get]
   functions:
     - get_active_users
@@ -48,11 +50,16 @@ rate_limit:
 - **`database`**: Your SQLAlchemy database connection string. AutoCRUD does not create tables; they must already exist.
 - **`models_module`** (required): The dotted import path of the module that defines your SQLAlchemy mapped classes, importable from the directory you run `autocrud` in (e.g. `myapp.models`, or `examples.demo_app.models` for the bundled example).
 - **`functions_module`** (optional): The dotted import path of the module that defines the functions under `expose.functions`. Defaults to `models_module`.
-- **`expose.models`**: The mapped classes to expose, by class name. You can specify which CRUD operations (`list`, `get`, `create`, `update`, `delete`) to enable for each model.
+- **`expose.models`**: The mapped classes to expose, by class name. For each model, list the CRUD operations (`list`, `get`, `create`, `update`, `delete`) to enable, or use a mapping with `operations` and an optional `exclude_fields` list of column names to leave out of every request and response schema. Excluding a column that `create` needs (not nullable, no default) is an error.
 - **`expose.functions`**: A list of regular Python functions you want to expose as secure GET endpoints at `/functions/{name}`.
-- **`security.api_key`**: The secret key that clients must provide in the `X-API-Key` header to access the API.
+- **`security.api_key`**: The secret key that clients must provide in the `X-API-Key` header to access the API. The `AUTOCRUD_API_KEY` environment variable, when set, overrides it, so you can keep the key out of the file.
+- **`rate_limit.requests_per_minute`** (optional): How many requests each client IP may make in any 60-second window. Leave it out for no limit.
 
-The config is checked when you run `serve` or `publish`; a missing key, an unknown operation or an unknown model is reported with a short error message. An unknown model name lists the mapped classes available in `models_module`.
+The config is checked when you run `serve` or `publish`; a missing key, an unknown operation or an unknown model is reported with a short error message. An unknown model name lists the mapped classes available in `models_module`. The server refuses to start if no API key is configured, or if the key is `test-secret` (the key earlier versions of the example config shipped with).
+
+### Exposed Functions
+
+Each name under `expose.functions` is imported from `functions_module` and served at `GET /functions/{name}`, behind the same API key and rate limit as the CRUD routes. The function's parameters become query parameters, typed from its annotations (unannotated parameters are strings) and required unless they have a default. The return value is sent as JSON. For example, the bundled `greet(name: str, times: int = 1)` is called with `GET /functions/greet?name=Ada&times=2`, and `times=many` returns 422.
 
 ### Generated Routes
 
@@ -66,7 +73,7 @@ Only the operations you list for a model are registered. For a model whose table
 | `update` | `PATCH /users/{pk}` | Partial update; 404 if the row does not exist |
 | `delete` | `DELETE /users/{pk}` | Returns 204; 404 if the row does not exist |
 
-Request and response bodies use Pydantic schemas built from your columns' Python types: `UserRead` (every column), `UserCreate` (no autoincrement primary key; nullable or defaulted columns optional) and `UserUpdate` (every non-key column optional). A change that violates a database constraint returns 409. Each request gets its own database session, committed on success and rolled back on error.
+Request and response bodies use Pydantic schemas built from your columns' Python types: `UserRead` (every column not in `exclude_fields`), `UserCreate` (no autoincrement primary key; nullable or defaulted columns optional) and `UserUpdate` (every non-key column optional). A change that violates a database constraint returns 409. Each request gets its own database session, committed on success and rolled back on error.
 
 ### 3. Serve Your API
 
@@ -101,8 +108,9 @@ You will see all your configured endpoints, their expected inputs, and their res
 
 ## Security Considerations
 
-- **API Key**: Your API is protected by an API key. Never expose this key in public client-side code. All requests must include the `X-API-Key` header with your secret key.
-- **Model Exposure**: Be very careful about which models and fields you expose. By default, `autocrud` does not expose any of your models. You must explicitly whitelist them in your `autocrud.yml`. Avoid exposing sensitive data like user passwords or other personal identifiable information (PII). `autocrud` will warn you if it detects columns with potentially sensitive names (e.g., `password`, `email`, `ssn`).
+- **API Key**: Your API is protected by an API key. Never expose this key in public client-side code. All requests must include the `X-API-Key` header with your secret key; a missing or wrong key gets 401. The key is read once at startup (from `AUTOCRUD_API_KEY`, else `security.api_key`) and compared in constant time.
+- **Rate Limiting**: Going over `rate_limit.requests_per_minute` returns 429 with a `Retry-After` header giving the seconds to wait. Requests are counted per client IP before the key is checked, so wrong-key guesses are limited too. The counts are kept in memory **per process**: with several workers or replicas, each allows the full limit, and a restart resets them. Behind a reverse proxy every request may come from the proxy's IP unless uvicorn is told to trust forwarded headers. Use a shared limiter (e.g. at your proxy) if you need a global limit.
+- **Model Exposure**: Be very careful about which models and fields you expose. By default, `autocrud` does not expose any of your models. You must explicitly whitelist them in your `autocrud.yml`. Avoid exposing sensitive data like user passwords or other personal identifiable information (PII). At startup, `autocrud` logs a warning for each exposed column whose name contains `password`, `passwd`, `secret`, `token`, `ssn`, `email` or `api_key`; remove such columns with `exclude_fields`.
 - **Database Permissions**: For production environments, it is strongly recommended to use a database user with the least required privileges. For example, if you only need to expose `get` and `list` operations, use a database user with read-only access.
 
 ## Contribution Guidelines

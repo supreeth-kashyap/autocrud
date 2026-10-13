@@ -23,21 +23,38 @@ expose:
   # Nothing is exposed until you list it here, for example:
   #   models:
   #     User: [list, get]
+  # To keep columns out of requests and responses, use the long form:
+  #     User:
+  #       operations: [list, get]
+  #       exclude_fields: [password_hash]
   models: {{}}
-  # Plain functions to expose as GET endpoints.
+  # Functions to expose as GET /functions/<name>; their parameters become
+  # query parameters, typed from their annotations.
   functions: []
 
 security:
   # Clients must send this in the X-API-Key header. Keep it secret.
+  # The AUTOCRUD_API_KEY environment variable overrides it.
   api_key: "{api_key}"
 
 rate_limit:
+  # Per client IP, counted separately in each server process.
   requests_per_minute: 100
 """
+
+MODEL_OPTIONS = ("operations", "exclude_fields")
 
 
 class ConfigError(ValueError):
     """Raised when the config file is missing, unparsable or invalid."""
+
+
+def model_options(spec):
+    """Returns (operations, exclude_fields) for one expose.models entry, which is
+    either a list of operations or a mapping with 'operations' and 'exclude_fields'."""
+    if isinstance(spec, dict):
+        return spec.get("operations") or [], spec.get("exclude_fields") or []
+    return spec, []
 
 
 def get_config(path="autocrud.yml", validate=True):
@@ -81,7 +98,18 @@ def validate_config(data, path="autocrud.yml"):
     models = expose.get("models") or {}
     if not isinstance(models, dict):
         fail("'expose.models' must map model names to lists of operations.")
-    for name, ops in models.items():
+    for name, spec in models.items():
+        if isinstance(spec, dict):
+            unknown = [key for key in spec if key not in MODEL_OPTIONS]
+            if unknown:
+                fail(
+                    f"unknown option(s) {', '.join(map(str, unknown))} for model '{name}'; "
+                    f"expected: {', '.join(MODEL_OPTIONS)}."
+                )
+            exclude = spec.get("exclude_fields") or []
+            if not isinstance(exclude, list) or not all(isinstance(f, str) for f in exclude):
+                fail(f"'exclude_fields' for model '{name}' must be a list of column names.")
+        ops, _ = model_options(spec)
         if not isinstance(ops, list):
             fail(f"operations for model '{name}' must be a list, e.g. [list, get].")
         for op in ops:
@@ -97,9 +125,12 @@ def validate_config(data, path="autocrud.yml"):
     security = data["security"]
     if not isinstance(security, dict):
         fail("'security' must be a mapping with an 'api_key'.")
-    api_key = security.get("api_key")
-    if not isinstance(api_key, str) or not api_key:
-        fail("'security.api_key' must be a non-empty string.")
+    # The key may instead come from AUTOCRUD_API_KEY; generate_app refuses
+    # to start if neither is set.
+    if "api_key" in security:
+        api_key = security["api_key"]
+        if not isinstance(api_key, str) or not api_key:
+            fail("'security.api_key' must be a non-empty string.")
 
     rate_limit = data.get("rate_limit")
     if rate_limit is not None:
