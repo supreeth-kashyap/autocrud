@@ -1,4 +1,5 @@
 import os
+import sqlite3
 
 import uvicorn
 from click.testing import CliRunner
@@ -15,6 +16,18 @@ expose:
 security:
   api_key: secret
 """
+
+def create_raw_database(path):
+    """Builds a SQLite file with raw DDL, so there are no Python models to import."""
+    connection = sqlite3.connect(path)
+    try:
+        connection.executescript(
+            "CREATE TABLE authors (id INTEGER PRIMARY KEY, name TEXT NOT NULL, email TEXT);"
+            "CREATE TABLE events (kind TEXT NOT NULL, note TEXT);"
+        )
+        connection.commit()
+    finally:
+        connection.close()
 
 # Test that init writes a valid, commented config with a random API key
 def test_init_writes_random_key_and_template():
@@ -75,14 +88,62 @@ def test_serve_refuses_insecure_or_missing_api_key(monkeypatch):
         assert result.exit_code == 1
         assert "No API key configured" in result.output
 
-def test_serve_reports_missing_models_module():
+# Test that without models_module, expose.models names tables, and unknown ones are reported
+def test_serve_without_models_module_reflects_tables():
     runner = CliRunner()
     with runner.isolated_filesystem():
         with open("autocrud.yml", "w") as f:
             f.write(VALID_CONFIG.replace("models_module: examples.demo_app.models\n", ""))
         result = runner.invoke(cli, ["serve"])
         assert result.exit_code == 1
-        assert "missing required key 'models_module'" in result.output
+        assert "Unknown table(s) in expose.models: User" in result.output
+        assert "Tables in the database: none" in result.output
+        assert "Traceback" not in result.output
+
+# Test that inspect prints tables, columns and primary keys
+def test_inspect_lists_tables():
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        create_raw_database("app.db")
+        result = runner.invoke(cli, ["inspect", "--database", "sqlite:///app.db"])
+        assert result.exit_code == 0, result.output
+        assert result.output.splitlines() == [
+            "authors (primary key: id)",
+            "  id: INTEGER, primary key",
+            "  name: TEXT, not null",
+            "  email: TEXT",
+            "events (no primary key: list only)",
+            "  kind: TEXT, not null",
+            "  note: TEXT",
+        ]
+
+# Test the zero-code quickstart: init --database, then serve with no models_module
+def test_init_with_database_then_serve(monkeypatch):
+    calls = []
+    monkeypatch.setattr(uvicorn, "run", lambda app, **kwargs: calls.append(app))
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        create_raw_database("app.db")
+        result = runner.invoke(cli, ["init", "--database", "sqlite:///app.db"])
+        assert result.exit_code == 0, result.output
+        assert "Exposed 2 table(s) read-only: authors, events." in result.output
+
+        config = get_config("autocrud.yml")
+        assert config["database"] == "sqlite:///app.db"
+        assert "models_module" not in config
+        assert config["expose"]["models"] == {
+            "authors": {"operations": ["list", "get"], "exclude_fields": ["email"]},
+            "events": ["list"],
+        }
+
+        result = runner.invoke(cli, ["serve"])
+        assert result.exit_code == 0, result.output
+        paths = {route.path for route in calls[0].routes}
+        assert {"/authors", "/authors/{pk}", "/events"} <= paths
+
+        result = runner.invoke(cli, ["inspect"])
+        assert result.exit_code == 0, result.output
+        assert "authors (primary key: id)" in result.output
 
 def test_serve_reports_missing_file():
     runner = CliRunner()

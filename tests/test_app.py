@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import sqlite3
 
 import pytest
 from sqlalchemy import create_engine
@@ -11,6 +12,24 @@ from autocrud.security import API_KEY_ENV_VAR, SlidingWindowRateLimiter
 from examples.demo_app.models import Base
 
 API_KEY = "unit-test-key"
+
+# Raw DDL, so the reflection tests have no Python models to import.
+RAW_DDL = """
+CREATE TABLE authors (id INTEGER PRIMARY KEY, name TEXT NOT NULL, email TEXT);
+CREATE TABLE books (id INTEGER PRIMARY KEY, title TEXT NOT NULL,
+                    author_id INTEGER REFERENCES authors(id));
+CREATE TABLE events (kind TEXT NOT NULL, note TEXT);
+"""
+
+def sqlite_execute(path, script=RAW_DDL, rows=()):
+    """Runs a SQL script, then inserts rows into events, with the sqlite3 module directly."""
+    connection = sqlite3.connect(str(path))
+    try:
+        connection.executescript(script)
+        connection.executemany("INSERT INTO events VALUES (?, ?)", rows)
+        connection.commit()
+    finally:
+        connection.close()
 
 def request(app, method, path, body=None, query="", api_key=API_KEY, client="testclient"):
     """Sends one request straight to the ASGI app; returns (status, headers, parsed JSON or None).
@@ -69,6 +88,19 @@ def config(tmp_path):
         "expose": {"models": {
             "User": ["list", "get", "create", "update", "delete"],
             "Order": ["list"],
+        }},
+        "security": {"api_key": API_KEY},
+    }
+
+@pytest.fixture
+def reflected_config(tmp_path):
+    """A config with no models_module, for a database created with raw DDL."""
+    sqlite_execute(tmp_path / "raw.db")
+    return {
+        "database": f"sqlite:///{tmp_path / 'raw.db'}",
+        "expose": {"models": {
+            "authors": ["list", "get", "create", "update", "delete"],
+            "books": ["list", "create"],
         }},
         "security": {"api_key": API_KEY},
     }
@@ -298,3 +330,79 @@ def test_validate_config_checks_model_options(config):
     with pytest.raises(ConfigError) as e:
         validate_config(config)
     assert "unknown option(s) hide for model 'User'" in str(e.value)
+
+# Test that without models_module, tables reflected from the database are served by name
+def test_reflected_tables_crud_round_trip(reflected_config):
+    assert validate_config(reflected_config) is reflected_config
+    app = generate_app(reflected_config)
+    assert routes(app, "/books") == {("GET", "/books"), ("POST", "/books")}
+    schemas = app.openapi()["components"]["schemas"]
+    assert set(schemas["authorsCreate"]["required"]) == {"name"}
+    assert "id" not in schemas["authorsCreate"]["properties"]
+
+    status, ada = call(app, "POST", "/authors", {"name": "Ada", "email": "ada@example.com"})
+    assert status == 201
+    assert ada == {"id": 1, "name": "Ada", "email": "ada@example.com"}
+    assert call(app, "GET", "/authors/1") == (200, ada)
+    assert call(app, "POST", "/authors", {"email": "x@example.com"})[0] == 422
+    assert call(app, "GET", "/authors/1", api_key=None)[0] == 401
+
+    ada["name"] = "Ada L."
+    assert call(app, "PATCH", "/authors/1", {"name": "Ada L."}) == (200, ada)
+    assert call(app, "GET", "/authors/1") == (200, ada)
+
+    assert call(app, "POST", "/authors", {"name": "Grace"}) == (
+        201, {"id": 2, "name": "Grace", "email": None},
+    )
+    assert call(app, "DELETE", "/authors/2") == (204, None)
+    assert call(app, "GET", "/authors/2")[0] == 404
+    assert call(app, "GET", "/authors") == (200, [ada])
+
+    book = {"id": 1, "title": "Notes", "author_id": 1}
+    assert call(app, "POST", "/books", {"title": "Notes", "author_id": 1}) == (201, book)
+    assert call(app, "GET", "/books") == (200, [book])
+
+def test_reflected_unknown_table_lists_tables(reflected_config):
+    reflected_config["expose"]["models"] = {"Author": ["list"]}
+    with pytest.raises(ConfigError) as e:
+        generate_app(reflected_config)
+    assert "Unknown table(s) in expose.models: Author" in str(e.value)
+    assert "Tables in the database: authors, books, events." in str(e.value)
+
+# Test that a table without a primary key is served list-only, with a warning
+def test_table_without_primary_key_is_list_only(reflected_config, tmp_path, caplog):
+    sqlite_execute(tmp_path / "raw.db", script="", rows=[("b", None), ("a", "x"), ("a", "x")])
+    reflected_config["expose"]["models"] = {"events": ["list", "get"]}
+    with caplog.at_level(logging.WARNING, logger="autocrud.generator"):
+        app = generate_app(reflected_config)
+    assert "Table 'events' has no primary key, so only list is served for it (get skipped)." in caplog.text
+    assert routes(app, "/events") == {("GET", "/events")}
+
+    rows = [{"kind": "a", "note": "x"}, {"kind": "a", "note": "x"}, {"kind": "b", "note": None}]
+    assert call(app, "GET", "/events") == (200, rows)
+    assert call(app, "GET", "/events", query="limit=1&offset=2") == (200, rows[2:])
+
+# Test that expose.models: '*' needs allow_all_tables, and then serves every table read-only
+def test_all_tables_need_explicit_opt_in(reflected_config, caplog):
+    reflected_config["expose"]["models"] = "*"
+    with pytest.raises(ConfigError) as e:
+        validate_config(reflected_config)
+    assert "set 'expose.allow_all_tables: true' to confirm" in str(e.value)
+    reflected_config["expose"]["allow_all_tables"] = "yes"
+    with pytest.raises(ConfigError):
+        validate_config(reflected_config)
+
+    reflected_config["expose"]["allow_all_tables"] = True
+    assert validate_config(reflected_config) is reflected_config
+    with caplog.at_level(logging.WARNING, logger="autocrud.generator"):
+        app = generate_app(reflected_config)
+    assert routes(app, "/authors") == {("GET", "/authors"), ("GET", "/authors/{pk}")}
+    assert routes(app, "/books") == {("GET", "/books"), ("GET", "/books/{pk}")}
+    assert routes(app, "/events") == {("GET", "/events")}
+    warnings = [r.getMessage() for r in caplog.records if r.name == "autocrud.generator"]
+    assert warnings == [
+        "expose.models is '*': serving all 3 table(s) read-only: authors, books, events.",
+        "Model 'authors' exposes column 'email', whose name looks sensitive. "
+        "Add it to exclude_fields if clients should not see it.",
+        "Table 'events' has no primary key, so only list is served for it.",
+    ]

@@ -4,7 +4,7 @@ from importlib import metadata
 import click
 
 from . import __version__
-from .generator import generate_app, CONFIG_ENV_VAR
+from .generator import generate_app, inspect_database, suggested_models, CONFIG_ENV_VAR
 from .config import ConfigError, get_config, set_default_config
 
 PUBLISHED_FILES = ("main.py", "Dockerfile", "requirements.txt")
@@ -43,6 +43,27 @@ def _build_app(config_data):
         raise click.ClickException(str(e))
 
 
+def _inspect_database(url):
+    try:
+        return inspect_database(url)
+    except ConfigError as e:
+        raise click.ClickException(str(e))
+
+
+def _column_line(column):
+    try:
+        type_name = str(column.type)
+    except Exception:
+        # Some dialect-specific types only compile with their own dialect.
+        type_name = type(column.type).__name__
+    details = [type_name]
+    if column.primary_key:
+        details.append("primary key")
+    elif not column.nullable:
+        details.append("not null")
+    return f"  {column.name}: {', '.join(details)}"
+
+
 def _installed_version():
     try:
         return metadata.version("autocrud")
@@ -56,14 +77,48 @@ def cli():
     pass
 
 @cli.command()
-def init():
+@click.option("--database", help="Database URL to reflect; its tables are exposed read-only.")
+def init(database):
     """Creates a commented autocrud.yml config file with a random API key."""
     if os.path.exists("autocrud.yml"):
         click.confirm("autocrud.yml already exists. Overwrite?", abort=True)
 
-    set_default_config("autocrud.yml")
+    if not database:
+        set_default_config("autocrud.yml")
+        click.echo("✅ Created autocrud.yml with a random API key.")
+        click.echo("Edit models_module and expose.models, then run: autocrud serve")
+        return
+
+    # Read before writing, so an unreachable database leaves no config behind.
+    models = suggested_models(_inspect_database(database))
+    set_default_config("autocrud.yml", database=database, models=models)
     click.echo("✅ Created autocrud.yml with a random API key.")
-    click.echo("Edit models_module and expose.models, then run: autocrud serve")
+    if models:
+        click.echo(
+            f"Exposed {len(models)} table(s) read-only: {', '.join(models)}. "
+            "Review expose.models (sensitive-looking columns are in exclude_fields), "
+            "then run: autocrud serve"
+        )
+    else:
+        click.echo("No tables found in the database; add some, then list them under expose.models.")
+
+@cli.command()
+@click.option("--config", default="autocrud.yml", help="Path to the config file.")
+@click.option("--database", help="Database URL to inspect instead of the config's.")
+def inspect(config, database):
+    """Lists the database's tables, columns and primary keys, for writing expose.models."""
+    tables = _inspect_database(database or _load_config(config)["database"])
+    if not tables:
+        click.echo("No tables found.")
+        return
+    for table in tables:
+        primary_key = [column.name for column in table.primary_key.columns]
+        if primary_key:
+            click.echo(f"{table.name} (primary key: {', '.join(primary_key)})")
+        else:
+            click.echo(f"{table.name} (no primary key: list only)")
+        for column in table.columns:
+            click.echo(_column_line(column))
 
 @cli.command()
 @click.option("--config", default="autocrud.yml", help="Path to the config file.")
